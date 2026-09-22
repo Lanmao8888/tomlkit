@@ -150,6 +150,56 @@ class Container(_CustomDict):  # type: ignore[type-arg]
         self.append(name, table)
         return
 
+    @staticmethod
+    def _is_inline_item(key: Key | None, item: Item) -> bool:
+        """Whether a body entry renders without emitting any table header.
+
+        Plain values, comments and whitespace are always inline.  A table
+        only renders inline when it is a super table reached through a
+        dotted key (e.g. ``a.b = 1``) and every entry in its subtree also
+        renders inline; as soon as any descendant renders a header (a
+        concrete sub-table such as the ``c`` in ``a.b = 1`` plus
+        ``doc["a"]["c"] = {}``), everything following the entry falls
+        under that header's scope.
+        """
+        if not isinstance(item, (Table, AoT)):
+            return True
+        if (
+            isinstance(item, AoT)
+            or key is None
+            or not key.is_dotted()
+            or not item.is_super_table()
+        ):
+            return False
+        return all(Container._is_inline_item(k, v) for k, v in item.value.body)
+
+    @staticmethod
+    def _renders_inline_first(key: Key | None, item: Item) -> bool:
+        """Whether a body entry renders inline ``key = value`` lines before
+        its first table header (or renders no header at all).
+
+        A new table header may only be inserted before entries for which
+        this is ``False``; inserting it before an entry with leading inline
+        lines would capture those lines into the new table's scope.
+        """
+        if not isinstance(item, (Table, AoT)):
+            return True
+        if isinstance(item, AoT) or not item.is_super_table():
+            return False
+        if key is None or not key.is_dotted():
+            # A super table reached through a plain header either renders
+            # its own header first or only contains header-rendering
+            # children.
+            return False
+        # A super table parsed from a dotted key renders its inline
+        # children (plain values and inline dotted sub-tables) before any
+        # sub-table header.
+        return any(
+            Container._renders_inline_first(k, v)
+            for k, v in item.value.body
+            if not isinstance(v, (Whitespace, Null, Comment))
+        )
+
     def _get_last_index_before_table(self) -> int:
         last_index = -1
         for i, (k, v) in enumerate(self._body):
@@ -159,7 +209,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             if isinstance(v, Whitespace) and not v.is_fixed():
                 continue
 
-            if isinstance(v, (Table, AoT)) and k is not None and not k.is_dotted():
+            if (
+                isinstance(v, (Table, AoT))
+                and k is not None
+                and not self._is_inline_item(k, v)
+            ):
                 break
             last_index = i
         return last_index + 1
@@ -835,25 +889,39 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             if (
                 isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table))
                 or new_key != k.key
+                or (isinstance(value, (AoT, Table)) and k.is_dotted())
             ):
                 new_key = SingleKey(new_key)
             else:  # Inherit the sep of the old key
                 new_key = k
+        elif isinstance(value, (AoT, Table)) and new_key.is_dotted():
+            # A table/AoT renders its own header; keeping the dotted flag
+            # of a key parsed from a dotted key-value pair would re-apply
+            # the prefix to the new table's children.
+            new_key = SingleKey(new_key.key, sep=new_key.sep)
 
         del self._map[k]
         self._map[new_key] = idx
         if new_key != k:
             dict.__delitem__(self, k.key)
 
-        if isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table)):
+        if isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table)) or (
+            isinstance(value, (AoT, Table)) and self._is_inline_item(k, v)
+        ):
             self.remove(k)
             if isinstance(value, (AoT, Table)):
-                # new tables should appear after all non-table values
+                # new tables should appear after all values that still
+                # render inline (plain values and dotted key-value pairs),
+                # otherwise the new table's header would capture them
                 for i in range(idx, len(self._body)):
-                    if isinstance(self._body[i][1], (AoT, Table)):
-                        self._insert_at(i, new_key, value)
-                        idx = i
-                        break
+                    k2, v2 = self._body[i]
+                    if not isinstance(v2, (AoT, Table)) or self._renders_inline_first(
+                        k2, v2
+                    ):
+                        continue
+                    self._insert_at(i, new_key, value)
+                    idx = i
+                    break
                 else:
                     idx = -1
                     self.append(new_key, value)
@@ -1107,12 +1175,20 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
         elif self._tables:
             if not _is_table_or_aot(value):  # if the value is a plain value
                 for table in self._tables:
-                    # find the first table that allows plain values
-                    if any(not _is_table_or_aot(v) for _, v in table.items()):
+                    # A concrete table already renders its own header, so a
+                    # new plain value belongs there; adding it to a super
+                    # table would give that part a duplicate header.
+                    if not table.is_super_table():
                         table[key] = value
                         break
                 else:
-                    self._tables[0][key] = value
+                    for table in self._tables:
+                        # find the first table that allows plain values
+                        if any(not _is_table_or_aot(v) for _, v in table.items()):
+                            table[key] = value
+                            break
+                    else:
+                        self._tables[0][key] = value
             else:
                 self._tables[0][key] = value
         else:

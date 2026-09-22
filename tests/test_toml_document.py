@@ -1456,3 +1456,101 @@ value = 5
 """
 
     assert doc.as_string() == expected
+
+
+def test_replace_dotted_key_with_table_discards_dotted_prefix() -> None:
+    # The super table parsed from a dotted key carries a dotted key; turning
+    # it into a regular table must not re-apply the prefix to the children
+    # rendered under the new header.
+    doc = parse("fruit.apple = true\n")
+    doc["fruit"] = {"a": 1}
+
+    assert doc.as_string() == "\n[fruit]\na = 1\n"
+    # Round-trip: the rendered document holds the same data as the document
+    assert parse(doc.as_string()) == {"fruit": {"a": 1}}
+    assert parse(doc.as_string()) == doc
+
+
+def test_replace_dotted_key_with_table_does_not_capture_dotted_siblings() -> None:
+    # The new table's header must be rendered after the sibling entries that
+    # are still rendered inline, or they would be parsed as its children.
+    doc = parse("a.b = 1\nc.d = 2\n")
+    doc["a"] = {"x": 9}
+
+    assert doc.as_string() == "c.d = 2\n\n[a]\nx = 9\n"
+    assert parse(doc.as_string()) == {"a": {"x": 9}, "c": {"d": 2}}
+    assert parse(doc.as_string()) == doc
+
+
+def test_replace_dotted_key_with_aot_does_not_capture_dotted_siblings() -> None:
+    # Same as above, but the dotted key is replaced by an array of tables.
+    doc = parse("a.b = 1\nc.d = 2\n")
+    aot = tomlkit.aot()
+    element = tomlkit.table()
+    element["x"] = 9
+    aot.append(element)
+    doc["a"] = aot
+
+    assert doc.as_string() == "c.d = 2\n\n[[a]]\nx = 9\n"
+    assert parse(doc.as_string()) == {"a": [{"x": 9}], "c": {"d": 2}}
+    assert parse(doc.as_string()) == doc
+
+
+def test_replace_value_with_table_does_not_capture_dotted_siblings() -> None:
+    # Replacing a plain value with a table must place the new table after
+    # the dotted key-value pairs that follow the replaced value.
+    doc = parse("x = 1\nc.d = 2\n")
+    doc["x"] = {}
+
+    assert doc.as_string() == "c.d = 2\n\n[x]\n"
+    assert parse(doc.as_string()) == {"x": {}, "c": {"d": 2}}
+    assert parse(doc.as_string()) == doc
+
+
+def test_add_value_to_out_of_order_table_with_concrete_header() -> None:
+    # The concrete `[x]` header is declared after its sub-tables; a new plain
+    # value must land in that existing part instead of giving the header-less
+    # super part a duplicate `[x]` header.
+    doc = parse("[x.y.z.w]\n\n[x]\n")
+    doc["x"]["c"] = 3
+
+    assert doc.as_string() == "[x.y.z.w]\n\n[x]\nc = 3\n"
+    assert parse(doc.as_string()) == {"x": {"y": {"z": {"w": {}}}, "c": 3}}
+    assert parse(doc.as_string()) == doc
+
+
+def test_append_value_after_dotted_key_super_table_with_subtable() -> None:
+    # Once the dotted key's super table contains a sub-table that renders its
+    # own header (`[a.c]`), a new top-level value must not be appended after
+    # it, or it would be nested under that header on round-trip.
+    doc = parse("a.b = 1\n")
+    doc["a"]["c"] = {}
+    doc["z"] = 2
+
+    assert doc.as_string() == "z = 2\n\na.b = 1\n\n[a.c]\n"
+    assert parse(doc.as_string()) == {"a": {"b": 1, "c": {}}, "z": 2}
+    assert parse(doc.as_string()) == doc
+
+
+def test_append_value_after_fully_inline_dotted_key() -> None:
+    # A dotted key that still renders entirely inline must keep appended
+    # top-level values after it.
+    doc = parse("a.b = 1\n")
+    doc["z"] = 2
+
+    assert doc.as_string() == "a.b = 1\nz = 2\n"
+    assert parse(doc.as_string()) == {"a": {"b": 1}, "z": 2}
+    assert parse(doc.as_string()) == doc
+
+
+def test_replace_dotted_key_before_partially_inline_dotted_sibling() -> None:
+    # The sibling `c` renders inline lines (`c.d = 2`) before its own
+    # sub-table header (`[c.sub]`); the new `[a]` header must be placed
+    # after the whole entry, not between its inline lines and its header.
+    doc = parse("a.b = 1\nc.d = 2\n")
+    doc["c"]["sub"] = {}
+    doc["a"] = {"x": 9}
+
+    assert doc.as_string() == "c.d = 2\n\n[c.sub]\n\n[a]\nx = 9\n"
+    assert parse(doc.as_string()) == {"a": {"x": 9}, "c": {"d": 2, "sub": {}}}
+    assert parse(doc.as_string()) == doc
