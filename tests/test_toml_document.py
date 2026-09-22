@@ -1456,3 +1456,101 @@ value = 5
 """
 
     assert doc.as_string() == expected
+
+
+def test_replacing_dotted_key_table_with_table_drops_dotted_prefix() -> None:
+    # The super table created by ``fruit.apple = true`` renders inline; its
+    # replacement renders a ``[fruit]`` header, so the dotted prefix must be
+    # discarded instead of being repeated in front of the new keys.
+    doc = parse("fruit.apple = true\n")
+    doc["fruit"] = {"a": 1}
+
+    assert doc.as_string() == "[fruit]\na = 1\n"
+    # Round-trip: re-parsing the rendered document yields the same data.
+    assert parse(doc.as_string()).unwrap() == doc.unwrap() == {"fruit": {"a": 1}}
+
+
+def test_replacing_dotted_key_table_with_table_keeps_inline_siblings_out() -> None:
+    # ``c.d = 2`` still renders inline after the replacement, so the new
+    # ``[a]`` table must be moved past it; otherwise ``c.d`` would be
+    # captured by the ``[a]`` header on round-trip.
+    doc = parse("a.b = 1\nc.d = 2\n")
+    doc["a"] = {"x": 9}
+
+    assert doc.as_string() == "c.d = 2\n\n[a]\nx = 9\n"
+    assert parse(doc.as_string()).unwrap() == doc.unwrap() == {
+        "a": {"x": 9},
+        "c": {"d": 2},
+    }
+
+
+def test_replacing_dotted_key_table_with_aot_keeps_inline_siblings_out() -> None:
+    # Same as above, but the dotted-key entry is replaced by an array of
+    # tables: the ``[[a]]`` header must not swallow the inline ``c.d = 2``.
+    doc = parse("a.b = 1\nc.d = 2\n")
+    aot = tomlkit.aot()
+    aot.append({"x": 9})
+    doc["a"] = aot
+
+    assert doc.as_string() == "c.d = 2\n\n[[a]]\nx = 9\n"
+    assert parse(doc.as_string()).unwrap() == doc.unwrap() == {
+        "a": [{"x": 9}],
+        "c": {"d": 2},
+    }
+
+
+def test_replacing_value_with_table_keeps_dotted_siblings_out() -> None:
+    # Replacing a plain value with a table must place the new ``[x]``
+    # header after the inline ``c.d = 2`` sibling.
+    doc = parse("x = 1\nc.d = 2\n")
+    doc["x"] = {}
+
+    assert doc.as_string() == "c.d = 2\n\n[x]\n"
+    assert parse(doc.as_string()).unwrap() == doc.unwrap() == {
+        "x": {},
+        "c": {"d": 2},
+    }
+
+
+def test_setting_value_on_out_of_order_table_uses_existing_header() -> None:
+    # ``[x]`` is declared after its sub-table ``[x.y.z.w]``; adding a plain
+    # key through the out-of-order proxy must write into the existing
+    # ``[x]`` section instead of rendering a duplicate header.
+    doc = parse("[x.y.z.w]\n\n[x]\n")
+    doc["x"]["c"] = 3
+
+    rendered = doc.as_string()
+    assert rendered == "[x.y.z.w]\n\n[x]\nc = 3\n"
+    assert rendered.count("[x]") == 1
+    # The output must still be parseable and round-trip to the same data.
+    assert parse(rendered).unwrap() == doc.unwrap() == {
+        "x": {"y": {"z": {"w": {}}}, "c": 3}
+    }
+
+
+def test_appending_scalar_after_dotted_key_with_header_child() -> None:
+    # Once the dotted-key super table ``a`` contains a child that renders
+    # its own ``[a.c]`` header, a new top-level scalar must not be nested
+    # into that table's scope.
+    doc = parse("a.b = 1\n")
+    doc["a"]["c"] = {}
+    doc["z"] = 2
+
+    rendered = doc.as_string()
+    assert parse(rendered).unwrap() == doc.unwrap() == {
+        "a": {"b": 1, "c": {}},
+        "z": 2,
+    }
+
+
+def test_appending_scalar_after_fully_inline_dotted_key() -> None:
+    # A dotted key that still renders fully inline keeps plain values
+    # appended after it.
+    doc = parse("a.b = 1\n")
+    doc["z"] = 2
+
+    assert doc.as_string() == "a.b = 1\nz = 2\n"
+    assert parse(doc.as_string()).unwrap() == doc.unwrap() == {
+        "a": {"b": 1},
+        "z": 2,
+    }

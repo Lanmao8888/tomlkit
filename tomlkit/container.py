@@ -159,7 +159,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             if isinstance(v, Whitespace) and not v.is_fixed():
                 continue
 
-            if isinstance(v, (Table, AoT)) and k is not None and not k.is_dotted():
+            if (
+                isinstance(v, (Table, AoT))
+                and k is not None
+                and not _is_inline_item(k, v)
+            ):
                 break
             last_index = i
         return last_index + 1
@@ -223,6 +227,7 @@ class Container(_CustomDict):  # type: ignore[type-arg]
                 item.invalidate_display_name()
             if (
                 self._body
+                and prev is not None
                 and not (self._parsed or item.trivia.indent or prev_ws)
                 and key is not None
                 and not key.is_dotted()
@@ -231,7 +236,11 @@ class Container(_CustomDict):  # type: ignore[type-arg]
 
         if isinstance(item, AoT) and self._body and not self._parsed:
             item.invalidate_display_name()
-            if item and not ("\n" in item[0].trivia.indent or prev_ws):
+            if (
+                item
+                and prev is not None
+                and not ("\n" in item[0].trivia.indent or prev_ws)
+            ):
                 item[0].trivia.indent = "\n" + item[0].trivia.indent
 
         if key is not None and key in self:
@@ -840,17 +849,31 @@ class Container(_CustomDict):  # type: ignore[type-arg]
             else:  # Inherit the sep of the old key
                 new_key = k
 
+        # Whether the old and new items render a table header at their
+        # position.  A super table created from a dotted key (``a.b = 1``)
+        # renders inline, so it must be treated like a plain value when
+        # deciding where its replacement belongs.
+        old_is_table = isinstance(v, (AoT, Table)) and not _is_inline_item(k, v)
+        new_is_table = isinstance(value, (AoT, Table))
+
+        if new_is_table and new_key.is_dotted():
+            # The replacement is no longer part of a dotted key pair; keeping
+            # the dotted flag would repeat the prefix in front of every key
+            # rendered inside the new table.
+            new_key._dotted = False
+
         del self._map[k]
         self._map[new_key] = idx
         if new_key != k:
             dict.__delitem__(self, k.key)
 
-        if isinstance(value, (AoT, Table)) != isinstance(v, (AoT, Table)):
+        if new_is_table != old_is_table:
             self.remove(k)
-            if isinstance(value, (AoT, Table)):
+            if new_is_table:
                 # new tables should appear after all non-table values
                 for i in range(idx, len(self._body)):
-                    if isinstance(self._body[i][1], (AoT, Table)):
+                    k_i, v_i = self._body[i]
+                    if isinstance(v_i, (AoT, Table)) and not _is_inline_item(k_i, v_i):
                         self._insert_at(i, new_key, value)
                         idx = i
                         break
@@ -1112,7 +1135,16 @@ class OutOfOrderTableProxy(_CustomDict):  # type: ignore[type-arg]
                         table[key] = value
                         break
                 else:
-                    self._tables[0][key] = value
+                    # No table holds plain values yet; prefer a concrete
+                    # (non-super) table so the value lands in the existing
+                    # ``[table]`` section instead of forcing a super table
+                    # to render a duplicate header.
+                    for table in self._tables:
+                        if not table.is_super_table():
+                            table[key] = value
+                            break
+                    else:
+                        self._tables[0][key] = value
             else:
                 self._tables[0][key] = value
         else:
@@ -1165,6 +1197,28 @@ def ends_with_whitespace(it: Any) -> bool:
     return (
         isinstance(it, Table) and isinstance(it.value._previous_item(), Whitespace)
     ) or (isinstance(it, AoT) and len(it) > 0 and isinstance(it[-1], Whitespace))
+
+
+def _is_inline_item(key: Key | None, item: Item) -> bool:
+    """Whether the item renders without emitting any table header.
+
+    Plain values always render inline.  A super table that originates from a
+    dotted key (``a.b = 1``) renders inline as well, but only as long as all
+    of its own table children also render inline; as soon as one of them
+    renders a ``[header]`` (e.g. after ``doc["a"]["c"] = {}``), everything
+    appended after the item would be captured by that header on round-trip.
+    """
+    if isinstance(item, AoT):
+        return False
+    if not isinstance(item, Table):
+        return True
+    if not item.is_super_table() or key is None or not key.is_dotted():
+        return False
+    return all(
+        _is_inline_item(k, v)
+        for k, v in item.value.body
+        if isinstance(v, (Table, AoT))
+    )
 
 
 def _equal_with_nan(left: Any, right: Any) -> bool:
